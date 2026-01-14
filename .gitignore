@@ -1,0 +1,55 @@
+# ===============================
+# PowerShell / Script Outputs
+# ===============================
+
+# Generated CSV reports
+*.csv
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# ===============================
+# PowerShell & Windows Artifacts
+# ===============================
+
+# PowerShell module build artifacts
+*.psm1.old
+*.psd1.old
+
+# Windows thumbnail cache
+Thumbs.db
+ehthumbs.db
+
+# ===============================
+# Editor / IDE Noise
+# ===============================
+
+# VS Code
+.vscode/
+
+# Rider / JetBrains
+.idea/
+
+# Visual Studio
+.vs/
+
+# ===============================
+# OS Files
+# ===============================
+
+# macOS
+.DS_Store
+
+# Linux
+*~
+
+# ===============================
+# Optional: Local-only files
+# ===============================
+
+# Example: local test runs
+*.out
