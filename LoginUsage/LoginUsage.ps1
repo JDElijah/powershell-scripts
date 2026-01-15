@@ -148,3 +148,40 @@ function Get-OverlapMinutes {
     return (New-TimeSpan -Start $s -End $e).TotalMinutes   
 }
 
+# ---------- Read Events ----------
+$lookupStart = if ($ExtendLookupWindow) { $StartTime.AddMinutes(-$MaxSessionMinutes) } else { $StartTime }
+
+$filter = @{
+    LogName   = "Security"
+    Id        = 4800, 4801, 4624, 4634, 4647
+    StartTime = $lookupStart
+    EndTime   = $EndTime
+}
+
+try {
+    $events = Get-WinEvent -FilterHashtable $filter -ErrorAction Stop | Sort-Object TimeCreated
+}
+catch {
+    Write-Error "Failed to read Security log. Run PowerShell as Administrator. Details: $($_.Exception.Message)"
+    return
+}
+
+# Track unlock->lock sessions 
+$openUnlockSessions = @{}   # key => @{ User, Start}
+
+# Track logon->logoff sessions (fallback)
+$openLogonSessions = @{}    # TargetLogonId => @{ User, Start, LogonType }
+
+# Stats
+$userStats = @{}
+$totalLogins = 0
+
+# Diagnostics (use a plain hashtable wth string keys to avoid OrderDictionary/index issues)
+$diag = @{
+    "4801" = 0
+    "4800" = 0
+    "4624" = 0
+    "4634" = 0
+    "4647" = 0
+}
+
