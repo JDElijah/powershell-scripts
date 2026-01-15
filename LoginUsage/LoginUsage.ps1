@@ -54,7 +54,7 @@ function Get-EventDataValue {
 function Get-FirstNonEmptyEventField {
     param(
         [Parameter(Mandatory)] [xml]$EventXml, 
-        [Parameter(Mandatory)] [string[]]$Names, 
+        [Parameter(Mandatory)] [string[]]$Names
     )
     foreach ($n in $Names) {
         $v = Get-EventDataValue -EventXml $EventXml -Name $n
@@ -135,6 +135,7 @@ function Add-UseMinutes {
     else { $Stat.LogonLogoffMinutes += $m }
 }
 
+# Calculates how many minutes of a session overlap with the reporting time window
 function Get-OverlapMinutes {
     param(
         [datetime]$IntervalStart, 
@@ -146,3 +147,4 @@ function Get-OverlapMinutes {
     $e = if ($IntervalEnd -gt $WindowEnd) { $WindowEnd } else { $IntervalEnd }
     return (New-TimeSpan -Start $s -End $e).TotalMinutes   
 }
+
