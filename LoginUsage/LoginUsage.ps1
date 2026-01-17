@@ -1,23 +1,30 @@
 <#
+    Unlock-centric lab usage report to CSV (grouped by SID)
 
-This script reads Windows Security Even Log entries
-and build a csv report. 
+    ----- DESCRIPTION -----
+    - Usage time is calculated only from workstation Unlock(4801) -> Lock (4800)
+    - If a Lock event is missing, open Unlock sessions are closed using: 
+        1. Logoff (4634) as an end marker (same LogonId preferred, otherwise same SID), 
+        2. System shutdown/reboot events as machine-wide end markers, 
+        3. EndTime as a last resort. 
+    - Users are groupd by SID to avoid duplicate "users"  ehrn yhr dsmr dyufrny spprstd as: 
+        - numeric ID (sAMAccountName) and 
+        - email/UPN 
+    - 4624 events are still used for counting "Logins" (interactive-ish types) but NOT for time. 
 
-It calculates: 
-    - Number of unique logins.
-    - Number of logins (interactive-ish) peruser 
-    - Estimated "use time" per user. 
-
-It tries to estimate "use time" in the best available way: 
-    1) Unlock -> Lock Time (best proxy for active presence) if
-    events exist. 
-    2) Otherwise, fall back to Logon -> Logoff time
-
-IMPORTANT: 
-    - If your machine is not looing lock/unlock events (4800/4801),
-    the unlock/lock method will contribute 0, and the script will use
-    the logon/logoff fallback. 
-
+    ----- NOTES -----
+    Requires Admin to read Security log. 
+    Security events (end markers): 
+        4801        = Workstation Unlocked
+        4800        = Workstation locked 
+        4624        = Logon (count only)
+        4634        = Logoff (end maker only)
+        4647        = User initiated logoff(ignored)
+    System events (end markers): 
+        41          = Kernel-Power (unexpected restart) 
+        1074        = Planned shutdown/restart
+        6006        = Event log service stopped (clean shutdown)
+        6008        = Unexpected shutdown. 
 #>
 
 [CmdletBinding()]
@@ -25,163 +32,25 @@ param(
     [datetime]$StartTime = (Get-Date).AddDays(-30), 
     [datetime]$EndTime = (Get-Date), 
 
-    # Exclude/cap very long "use sessions" (e.g., left signed in)
-    [int]$MaxSessionMinutes = 480, #8 hours 
+    # Exclude / cap very long "use sessios" (e.g, left signed in)
+    [int]$MaxSessionMinutes = 480,  # 8 Hours 
     [switch]$CapLongSessions,
-
+    
     # Extend lookup window backwards so sessions that start before StartTime still count (clamped)
-    [switch]$ExtendLookupWindow = $true,
+    [switch]$ExtendLookupWindow = $true, 
 
-    #Output CSV
-    [string]$CSVPath = ".\login_usage_summary.csv",
+    # Output CSV
+    [string]$CsvPath = ".\login_usage_summary.csv.", 
 
-    # Which 4624 logon types to count as "logins"
-    # 2=Interactive, 7=Unlock, 10=RemoteInteractive RDP), 11=CachedInteractie 
-    [int[]]$AllowedLogonTypes = @(2, 7, 10, 11)
+    # Which 4624 logoin types top count as "logins" 
+    # 2=Interactive, 7=Unlock, 10=RemoteInteractive (RDP), 11=CachedInteractive
+    [int[]]$AllowedLogonTypes = @(2,7,10,11), 
+
+    # Close open unlock session on shutdown/reboot events from System log. 
+    [switch]$UseSystemEndMarkers = $true
 )
 
-# ---------- Helpers ----------
-# Returns the value of a named <Data> field from a Windows Event's XML (or $null if missing)
-function Get-EventDataValue {
-    param(
-        [Parameter(Mandatory)] [xml]$EventXml, 
-        [Parameter(Mandatorty)] [string]$Name
-    )
-    ($EventXml.Event.EventData.Data | Where-Object { $_.Name -eq $Name } | Select-Object -First 1).'#text'
-}
-
-# Tries mulitple possible event field names and returns the first non-empty value found
-function Get-FirstNonEmptyEventField {
-    param(
-        [Parameter(Mandatory)] [xml]$EventXml, 
-        [Parameter(Mandatory)] [string[]]$Names
-    )
-    foreach ($n in $Names) {
-        $v = Get-EventDataValue -EventXml $EventXml -Name $n
-        if (-not [string]::IsNullOrWhiteSpace($v)) { return $v }
-    }
-    return $null
-}
-
-$IgnoreUsers = @("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "ANONYMOUS LOGON")
-
-# Determines whether a username should be ignored (system, service, machine, or temp accounts)
-function Should-IgnoreUser {
-    param([string]$User)
-    if ([string]::IsNullOrWhiteSpace($User)) { return $true }
-    if ($IgnoreUsers -contains $User.ToUpperInvariant()) { return $true }
-    if ($User.EndsWith("$")) { return $true }
-    if ($User -like "DWM-*") { return $true }
-    if ($User -like "UMFD-*") { return $true }
-    return $false    
-}
-
-# Normalize domain and username into "DOMAIN\User" format
-function Normalize-User {
-    param([string]$Domain, [string]$User)
-    if ([string]::IsNullOrWhiteSpace($User)) { return $null }
-    if ([string]::IsNullOrWhiteSpace($Domain)) { return $User }
-    return "$Domain\$User"
-}
-
-# Ensures user statistic object exists in the table, creating it if needed.     
-function Safe-AddUserStat {
-    param ([hashtable]$Table, [string]$User)
-    if (-not $Table.ContainsKey($User)) {
-        $Table[$User] = [pscustomobject]@{
-            User               = $User
-            Logins             = 0 
-            Sessions           = 0
-            UseMinutes         = 0
-            LongExcluded       = 0
-            LongCapped         = 0
-            UnlockLockMinutes  = 0.0 
-            LogonLogoffMinutes = 0.0
-            MethodUsed         = ""    # UnlockLock or LogonLogoff
-        }
-    }
-}
-
-# Adds session usage minutes to a user, applying long-session applying capping or exclusion rules
-function Add-UseMinutes {
-    param(
-        [pscustomobject]$Stat, 
-        [double]$Minutes, 
-        [int]$MaxSessionMinutes, 
-        [switch]$CapLongSessions, 
-        [ValidateSet("UnlockLock", "LogonLogoff")] [string]$Method
-    )
-
-    if ($Minutes -le 0) { return }
-
-    $Stat.Sessions++
-
-    if ($Minutes -gt $MaxSessionMinutes) {
-        if ($CapLongSessions) {
-            $Stat.UseMinutes += [double]$MaxSessionMinutes
-            $Stat.LongCapped++
-            if ($Method -eq "UnlockLock") { $Stat.UnlockLock += [double]$MaxSessionMinutes }
-            else { $Stat.LogonLogoffMinutes += [double]$MaxSessionMinutes }
-        }
-        else {
-            $Stat.LongExcluded++  
-        }
-        return
-    }
-
-    $m = [double][math]::Round($Minutes, 2)
-    $Stat.UseMinutes += $m
-    if ($Method -eq "UnlockLock") { $Stat.UnlockLockMinutes += $m }
-    else { $Stat.LogonLogoffMinutes += $m }
-}
-
-# Calculates how many minutes of a session overlap with the reporting time window
-function Get-OverlapMinutes {
-    param(
-        [datetime]$IntervalStart, 
-        [datetime]$IntervalEnd,
-        [datetime]$WindowStart,
-        [datetime]$WindowEnd
-    )
-    $s = if ($IntervalStart -lt $WindowStart) { $WindowStart } else { $IntervalStart }
-    $e = if ($IntervalEnd -gt $WindowEnd) { $WindowEnd } else { $IntervalEnd }
-    return (New-TimeSpan -Start $s -End $e).TotalMinutes   
-}
-
-# ---------- Read Events ----------
-$lookupStart = if ($ExtendLookupWindow) { $StartTime.AddMinutes(-$MaxSessionMinutes) } else { $StartTime }
-
-$filter = @{
-    LogName   = "Security"
-    Id        = 4800, 4801, 4624, 4634, 4647
-    StartTime = $lookupStart
-    EndTime   = $EndTime
-}
-
-try {
-    $events = Get-WinEvent -FilterHashtable $filter -ErrorAction Stop | Sort-Object TimeCreated
-}
-catch {
-    Write-Error "Failed to read Security log. Run PowerShell as Administrator. Details: $($_.Exception.Message)"
-    return
-}
-
-# Track unlock->lock sessions 
-$openUnlockSessions = @{}   # key => @{ User, Start}
-
-# Track logon->logoff sessions (fallback)
-$openLogonSessions = @{}    # TargetLogonId => @{ User, Start, LogonType }
-
-# Stats
-$userStats = @{}
-$totalLogins = 0
-
-# Diagnostics (use a plain hashtable wth string keys to avoid OrderDictionary/index issues)
-$diag = @{
-    "4801" = 0
-    "4800" = 0
-    "4624" = 0
-    "4634" = 0
-    "4647" = 0
-}
-
+# ----- Report metadata -----
+$ReportData = Get-Date 
+$ComputerId = $env:COMPUTERNAME
+$ReportFile = Split-Path -Leaf $CsvPath
