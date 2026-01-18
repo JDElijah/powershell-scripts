@@ -61,6 +61,8 @@ if ([string]::IsNullOrWhiteSpace($CsvPath)) {
 
 $ReportFile = Split-Path -Leaf $CsvPath
 
+
+
 # ----- Helper Functions -----
 
 ## Returns the text value of the first EventData <Data> element whose Name attribute matches the specified field name.
@@ -173,11 +175,12 @@ function Add-UnlockUseMinutes {
         [switch]$CapLongSessions
     )
 
-    if ($Minutes -gt $MaxSessonMinutes) {
+    if ($Minutes -gt $MaxSessionMinutes) {
         if ($CapLongSessions) {
             $Stat.UseMinutes += [double]$MaxSessionMinutes
             $Stat.LongCapped++
-        } else {
+        }
+        else {
             $Stat.LongExcluded++
         }
         return
@@ -187,3 +190,96 @@ function Add-UnlockUseMinutes {
     $Stat.UseMinutes += $m
 }
 
+## Returns the number of minutes where a time interval overlap a given window.
+function Get-OverlapMinutes {
+    param(
+        [datetime]$IntervalStart,
+        [datetime]$IntervalEnd,
+        [datetime]$WindowStart, 
+        [datetime]$WindowEnd
+    )
+
+    # Determine the actual overlap boundaries
+    # Interval: the time span of an actual event (session)
+    # Windwos: the time span you are analyzing against (Window)
+    # Interval: what happened, Window: When you care. 
+    $s = if ($IntervalStart -lt $WindowStart) { $WindowStart } else { $IntervalStart }
+    $e = if ($IntervalEnd -gt $WindowEnd) { $WindowEnd } else { $IntervalEnd }
+
+    # If there is no overlap, return 0
+    if ($s -ge $e) {
+        return 0
+    }
+    
+    return (New-TimeSpan -Start $s -End $e).TotalMinutes
+}
+
+## Closes an active unlock session at CloseTime and adds its overlapping minutes (within the reporting window) to the user's stats.
+function Close-UnlockSessionAtTime {
+    param(
+        [hashtable]$UserStats,
+        [pscustomobject]$Sess,      # { Sid, Start}
+        [datetime]$CloseTime,
+        [datetime]$WindowStart, 
+        [datetime]$WindowEnd, 
+        [int]$MaxSessionMinutes, 
+        [switch]$CapLongSessions
+    )
+
+    if ($null -eq $Sess -or [string]::IsNullOrWhiteSpace($Sess.Sid)) { return }
+    if (-not $UserStats.ContainsKey($Sess.Sid)) { return }
+
+    $mins = Get-OverlapMinutes -IntervalStart $Sess.Start -IntervalEnd $CloseTime -WindowStart $WindowStart -WindowEnd $WindowEnd
+    if ($mins -le 0) { return }
+
+    Add-UnlockUseMinutes -Start $UserStats[$Sess.Sid] -Minutes $mins -MaxSessionMinutes $MaxSessionMinutes -CapLongSessions:$CapLongSessions
+}
+
+
+# ----- Read Events -----
+
+# Optionally extend the lookup start time backward to catch sessions that began before the analysis window but overlap into it
+$lookupStart = if ($ExtendLookupWindow) { $StartTime.AddMinutes(-$MaxSessionMinutes) } else { $StartTime }
+
+# Security log (main)
+$securityFilter = @{
+    LogName   = "Security"
+    Id        = 4800, 4801, 4624, 4634, 4647 
+    StartTime = $lookupStart
+    EndTime   = $EndTime
+}
+
+try {
+    $secEvents = Get-WinEvent -FilterHashtable $securityFilter -ErrorAction Stop
+}
+catch {
+    Write-Error "Failed to read Security log. Run PowerShell as Administrator. Details: $($_.Exception.Message)"
+    return
+}
+
+# System log (optional end markers)
+$sysEvents = @()
+if ($UseSystemEndMarkers) {
+    $systemFilter = @{
+        LogName   = "System"
+        Id        = 41, 1074, 6006, 6008
+        StartTime = $lookupStart
+        EndTime   = $EndTime
+    }
+    try {
+        $sysEvents = Get-WinEvent -FilterHashtable $systemFilter -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Could not read System log end markers. Continuing with Security log only. Details: $($_.Exception.Message)"
+        $sysEvents = @{}
+    }
+}
+
+# Merge and sort chronologically 
+$events = @{}
+$events += $secEvents
+$events += $sysEvents
+$events = $events | Sort-Object TimeCreated
+
+
+# ---------- State ----------
