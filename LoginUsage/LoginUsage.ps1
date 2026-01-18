@@ -283,3 +283,61 @@ $events = $events | Sort-Object TimeCreated
 
 
 # ---------- State ----------
+
+# Open unlock session (keyed by LogonId when available; otherwise by SID)
+$openUnlockSessions = @{}   # "LID:<id>" or "SID:<sid>" => @{ Sid, Start }
+
+# Stats keyed by SID 
+$userStats = @{}    # Sid => stats
+$totalLogins = 0
+
+# Diagnostics
+$diag = @{
+    "4801" = 0
+    "4800" = 0
+    "4624" = 0
+    "4634" = 0
+    "4647" = 0
+    "SYS"  = 0
+}
+
+# ---------- Process events ----------
+foreach ($ev in $events) {
+    $time = [datetime]$ev.TimeCreated
+    $xml = [xml]$ev.ToXml()
+
+    # EventID is an XmlElement in some cases: use InnerText.
+    $eventId = [int]$xml.Event.System.EventID.InnerText
+
+    # Count Diagnostics 
+    $k = $eventId.ToString()
+    if ($diag.ContainsKey($k)) { $diag[$k] = $diag[$k] + 1 }
+    else { $diag["SYS"] = $diag["SYS"] + 1 }
+
+    switch ($eventId) {
+        # --- Unlock starts a session ---
+        4801 {
+            $user = Get-FirstNonEmptyEventField $xml @("SubjectUserName", "TargetUserName")
+            $domain = Get-FirstNonEmptyEventField $xml @("SubjectDomainName", "TargetDomainName")
+            $sid = Get-FirstNonEmptyEventField $xml @("SubjectUserSid", "TargetUserSid")
+            $logonId = Get-FirstNonEmptyEventField $xml @("SubjectLogonId", "TargetLogonId")
+            
+            if (Should-IgnoreUser $user) { break }
+            if ([string]::IsNullOrWhiteSpace($sid)) { break }
+
+            $display = Normalize-User $domain $user
+            Safe-AddUserStatBySid -Table $userStats -Sid $sid -DisplayName $display
+
+            $key = if (-not [string]::IsNullOrWhiteSpace($logonId)) { "LID:$logonId" } else { "SID:$sid" }
+
+            if (-not $openUnlockSessions.ContainsKey($key)) {
+                $openUnlockSessions[$key] = [pscustomobject]@{ Sid = $sid; Start = $time }
+            }
+            else {
+                if ($time -lt $openUnlockSessions[$key].Start) {
+                    $openUnlockSessions[$key].Start = $time
+                }
+            }
+        }
+    }
+}
